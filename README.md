@@ -154,6 +154,14 @@ Manual Review
 
 Include partyA and partyB nonces in the liquidation signature.
 
+
+
+## Discussion
+
+**MoonKnightDev**
+
+Fixed Code PR: https://github.com/SYMM-IO/symmio-core/pull/34
+
 # Issue H-2: `liquidatePositionsPartyA` limits partyB loss to partyB allocated balance, which can lead to inflated partyB balance and loss of funds for protocol users 
 
 Source: https://github.com/sherlock-audit/2023-08-symmetrical-judging/issues/6 
@@ -203,6 +211,14 @@ Manual Review
 
 Calculate total (signed) pnl for positions for each partyB before applying it: `amountToDeduct` should be for all positions combined for a particular partyB instead of separate positions.
 
+
+
+## Discussion
+
+**MoonKnightDev**
+
+Fixed Code PR: https://github.com/SYMM-IO/symmio-core/pull/36
+
 # Issue M-1: Wrong calculation of solvency in `fillCloseRequest` prevents the position from being closed even if the user is solvent after position closure 
 
 Source: https://github.com/sherlock-audit/2023-08-symmetrical-judging/issues/9 
@@ -239,7 +255,277 @@ Manual Review
 
 Require both parties to only be solvent at `closePrice` when the position is closed, there is no point in reverting if the position closure can make both parties solvent, even though one of it is not solvent before that.
 
-# Issue M-2: Position value can fall below minimum acceptable quote value when partially closing positions requested to be closed in full 
+
+
+## Discussion
+
+**MoonKnightDev**
+
+Fixed Code PR: https://github.com/SYMM-IO/symmio-core/pull/32
+
+# Issue M-2: Position closure might always revert in some cases due to allocatedBalances being unsigned, preventing the user from closing its positions 
+
+Source: https://github.com/sherlock-audit/2023-08-symmetrical-judging/issues/10 
+
+## Found by 
+panprog
+
+This is [issue 193](https://github.com/sherlock-audit/2023-06-symmetrical-judging/issues/193) from the previous audit contest. The liquidation part was fixed, but the main reason described here is still the same.
+
+Allocated balances are stored as unsigned ints. 
+
+https://github.com/sherlock-audit/2023-08-symmetrical/blob/main/symmio-core/contracts/storages/AccountStorage.sol#L37
+
+https://github.com/sherlock-audit/2023-08-symmetrical/blob/main/symmio-core/contracts/storages/AccountStorage.sol#L41
+
+Total account value is calculated as `allocated balance + unrealized pnl`, for example for liquidation purposes it's calculated as:
+
+https://github.com/sherlock-audit/2023-08-symmetrical/blob/main/symmio-core/contracts/libraries/LibAccount.sol#L83-L85
+
+In the other cases formula is similar. This means that in case of high unrealized profit, allocated balance might be valid to be negative. For example, a simple case is if account has opened position with unrealized profit of 1000 and locked balance of 100, allocated balance can theoretically be `-900` with account being safe from liquidation: `-900 + 1000 = 100 >= lockedBalance(100)`. But since balance is unsigned, transaction to deallocate such balance will revert. This might be expected behaviour.
+
+However, there are more complex cases possible where unsigned allocated balance can unexpectedly revert different transactions and block users from doing important actions. For example, if user has 2 opposite positions opened of the same quantity (LONG and SHORT) and price has moved significantly, total user `upnl = 0` (because opposite positions hedge each other completely). But the user will be unable to close either of these positions, because closing any position will subract high loss from the position from either partyA or partyB, which will make allocated balance negative and revert the transaction:
+
+Before closing position: 
+
+`Account Balance = Position 1 UPNL (+1000) + Position 2 UPNL (-1000) + Allocated Balance (100) = +100` (account solvent)
+
+After closing position: 
+
+`Account Balance should be = Position 1 UPNL (+1000) + Allocated Balance (-900) = +100` (account solvent), but it will revert.
+
+As such, both partyA and partyB will lose funds deposited into the protocol to keep these positions alive. It will also be impossible to finish liquidation of such positions if any account becomes liquidatable, effectively locking the funds for extended time (until price is in the range where positions can be closed without big loss).
+
+## Vulnerability Detail
+
+The scenario when user unexpectedly can't close position and loses funds:
+
+1. Open 2 large opposite positions between partyA and partyB such that one of them is in a high loss and the other in the same profit. Use minimal allocated balance both for partyA and partyB (because such opposite positions can't be liquidated by themselves as they perfectly hedge each other).
+2. When price moves significantly, try to close either of these positions, both will revert.
+3. Both partyA and partyB are stuck with the funds in the protocol which they can't take out until price goes back close to initial value.
+
+There might be the other cases with unexpected reverts and users being unable to close their positions.
+
+## Impact
+
+PartyA and PartyB funds can be unexpectedly locked in the protocol for extended time. PartyA or PartyB can allocate additional funds to be able to close positions, then deallocate and withdraw, however depending on situation, required funds to close such position might be orders of magnitude higher than what parties have or are willing to risk (due to leverage).
+
+This is High severity, because the situation can happen by itself for users having multiple positions: naturally some of them will be in profit, some in loss, and total upnl can be much smaller than individual positions, allowing a low allocated balance and making it impossible to close some positions.
+
+## Code Snippet
+
+Add this to any test, for example to `ClosePosition.behavior.ts`.
+
+```ts
+it("Unable to close positions due to unsigned allocatedBalances", async function () {
+  const context: RunContext = this.context;
+
+  this.user_allocated = decimal(82);
+  this.hedger_allocated = decimal(80);
+
+  this.user = new User(this.context, this.context.signers.user);
+  await this.user.setup();
+  await this.user.setBalances(this.user_allocated, this.user_allocated, this.user_allocated);
+
+  this.hedger = new Hedger(this.context, this.context.signers.hedger);
+  await this.hedger.setup();
+  await this.hedger.setBalances(this.hedger_allocated, this.hedger_allocated);
+
+  // open 2 opposite direction positions 
+  await this.user.sendQuote(limitQuoteRequestBuilder()
+    .quantity(decimal(100))
+    .price(decimal(1))
+    .cva(decimal(10)).lf(decimal(5)).mm(decimal(15))
+    .build()
+  );
+  await this.hedger.lockQuote(1, 0, decimal(4, 17));
+  await this.hedger.openPosition(1, limitOpenRequestBuilder().filledAmount(decimal(100)).openPrice(decimal(1)).price(decimal(1)).build());
+
+  await this.user.sendQuote(limitQuoteRequestBuilder()
+    .positionType(PositionType.SHORT)
+    .quantity(decimal(100))
+    .price(decimal(1))
+    .cva(decimal(10)).lf(decimal(5)).mm(decimal(15))
+    .build()
+  );
+  await this.hedger.lockQuote(2, 0, decimal(4, 17));
+  await this.hedger.openPosition(2, limitOpenRequestBuilder().filledAmount(decimal(100)).openPrice(decimal(1)).price(decimal(1)).build());
+
+  var info = await this.user.getBalanceInfo();
+  console.log("partyA allocated: " + info.allocatedBalances / 1e18 + " locked: " + info.totalLocked/1e18 + " pendingLocked: " + info.totalPendingLocked / 1e18);
+  var info = await this.hedger.getBalanceInfo(this.user.getAddress());
+  console.log("partyB allocated: " + info.allocatedBalances / 1e18 + " locked: " + info.totalLocked/1e18 + " pendingLocked: " + info.totalPendingLocked / 1e18);
+
+  // now the price doubles, with upnl still 0
+  // try to close LONG position
+
+  await this.user.requestToClosePosition(
+    1,
+    limitCloseRequestBuilder().quantityToClose(decimal(100)).closePrice(decimal(2)).build(),
+  );
+
+  await expect(this.hedger.fillCloseRequest(
+    1,
+    limitFillCloseRequestBuilder()
+      .filledAmount(decimal(100))
+      .closedPrice(decimal(2))
+      .build(),
+  )).to.be.revertedWith("LibSolvency: PartyB will be liquidatable");
+  
+  console.log("Attempt to close LONG position failed due to partyB being liquidatable");
+
+  // try to close SHORT position
+  await expect(this.user.requestToClosePosition(
+    2,
+    limitCloseRequestBuilder().quantityToClose(decimal(100)).closePrice(decimal(2)).build(),
+    )).to.be.revertedWith("LibSolvency: partyA will be liquidatable");
+
+  console.log("Attempt to close SHORT position failed due to partyA being liquidatable");
+
+});
+```
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Make allocated balances signed ints and change all appropriate parts where allocated balances are changed or verified. This will be more user-friendly (less limiting) and will prevent situations described in this bug report.
+
+
+
+## Discussion
+
+**nevillehuang**
+
+@MoonKnightDev, seems possible due to possibility of UPNL being negative causing allocated balance to fall below 0 and reverting since it is an uint. Could you shed some light on why this is disputed?
+
+**MoonKnightDev**
+
+> @MoonKnightDev, seems possible due to possibility of UPNL being negative causing allocated balance to fall below 0 and reverting since it is an uint. Could you shed some light on why this is disputed?
+
+One of the recognized challenges with cross positions relates to the scenario described above. To navigate this predicament:
+
+If PartyA wishes to close the winning position, PartyB must allocate funds to fulfill the close request.
+Should PartyB act maliciously, PartyA should first allocate funds to close the losing position and then proceed to close the winning one.
+
+**panprog**
+
+Escalate
+
+I believe this should be valid, because it causes all kinds of nasty underflows, the example I provided is just one scenario. Another scenario is partyA having allocated balance = 0 and positions in loss and profit with different partyBs, and then if partyB tries to call `emergencyClosePosition`, it will revert due to underflow (partyA position is in loss, but partyA allocated balance = 0, so the loss can not be applied).
+
+> One of the recognized challenges with cross positions relates to the scenario described above. To navigate this predicament:
+> 
+> If PartyA wishes to close the winning position, PartyB must allocate funds to fulfill the close request. Should PartyB act maliciously, PartyA should first allocate funds to close the losing position and then proceed to close the winning one.
+
+While it's possible to allocate and then close for partyA, this is still unexpected behavior for partyA: if it has position 1 in profit and position 2 in a loss, and it only wants to close position 1 (to realize profit), partyA will be unable to do so - all transactions will revert due to partyB allocatedBalance underflow when trying to apply position loss. So partyA **must** close position 2, then position 1.
+
+Another point to consider is that partyA might simply have not enough funds to allocate, close position 2, close position 1. For example, partyA opens huge long and short positions of similar size when ETH = 1000, with leverage = 10:
+Position 1: long 100 ETH (entry price = 1000) (cva+lf+mm=10000)
+Position 2: short 99 ETH (entry price = 1000) (cva+lf+mm=10000)
+Now ETH price shoots up to 2000. Both PartyA and PartyB still have 20000 collateral (which is enough to not be liquidated, because partyB total upnl is just 1000).
+partyA wants to close Position 1. Since it requires to reduce partyB allocatedBalance by 100 * (2000-1000) = 100000, it reverts.
+
+Now if partyA wants to close Position 1, it first has to close Position 2, but in order to close it, partyA must have allocated balance of 99 * (2000 - 1000) = 99000. But partyA only has 20000, it doesn't have access to such huge amount. So it's still stuck.
+
+**sherlock-admin2**
+
+ > Escalate
+> 
+> I believe this should be valid, because it causes all kinds of nasty underflows, the example I provided is just one scenario. Another scenario is partyA having allocated balance = 0 and positions in loss and profit with different partyBs, and then if partyB tries to call `emergencyClosePosition`, it will revert due to underflow (partyA position is in loss, but partyA allocated balance = 0, so the loss can not be applied).
+> 
+> > One of the recognized challenges with cross positions relates to the scenario described above. To navigate this predicament:
+> > 
+> > If PartyA wishes to close the winning position, PartyB must allocate funds to fulfill the close request. Should PartyB act maliciously, PartyA should first allocate funds to close the losing position and then proceed to close the winning one.
+> 
+> While it's possible to allocate and then close for partyA, this is still unexpected behavior for partyA: if it has position 1 in profit and position 2 in a loss, and it only wants to close position 1 (to realize profit), partyA will be unable to do so - all transactions will revert due to partyB allocatedBalance underflow when trying to apply position loss. So partyA **must** close position 2, then position 1.
+> 
+> Another point to consider is that partyA might simply have not enough funds to allocate, close position 2, close position 1. For example, partyA opens huge long and short positions of similar size when ETH = 1000, with leverage = 10:
+> Position 1: long 100 ETH (entry price = 1000) (cva+lf+mm=10000)
+> Position 2: short 99 ETH (entry price = 1000) (cva+lf+mm=10000)
+> Now ETH price shoots up to 2000. Both PartyA and PartyB still have 20000 collateral (which is enough to not be liquidated, because partyB total upnl is just 1000).
+> partyA wants to close Position 1. Since it requires to reduce partyB allocatedBalance by 100 * (2000-1000) = 100000, it reverts.
+> 
+> Now if partyA wants to close Position 1, it first has to close Position 2, but in order to close it, partyA must have allocated balance of 99 * (2000 - 1000) = 99000. But partyA only has 20000, it doesn't have access to such huge amount. So it's still stuck.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**nevillehuang**
+
+> Escalate
+> 
+> I believe this should be valid, because it causes all kinds of nasty underflows, the example I provided is just one scenario. Another scenario is partyA having allocated balance = 0 and positions in loss and profit with different partyBs, and then if partyB tries to call `emergencyClosePosition`, it will revert due to underflow (partyA position is in loss, but partyA allocated balance = 0, so the loss can not be applied).
+> 
+> > One of the recognized challenges with cross positions relates to the scenario described above. To navigate this predicament:
+> > If PartyA wishes to close the winning position, PartyB must allocate funds to fulfill the close request. Should PartyB act maliciously, PartyA should first allocate funds to close the losing position and then proceed to close the winning one.
+> 
+> While it's possible to allocate and then close for partyA, this is still unexpected behavior for partyA: if it has position 1 in profit and position 2 in a loss, and it only wants to close position 1 (to realize profit), partyA will be unable to do so - all transactions will revert due to partyB allocatedBalance underflow when trying to apply position loss. So partyA **must** close position 2, then position 1.
+> 
+> Another point to consider is that partyA might simply have not enough funds to allocate, close position 2, close position 1. For example, partyA opens huge long and short positions of similar size when ETH = 1000, with leverage = 10: Position 1: long 100 ETH (entry price = 1000) (cva+lf+mm=10000) Position 2: short 99 ETH (entry price = 1000) (cva+lf+mm=10000) Now ETH price shoots up to 2000. Both PartyA and PartyB still have 20000 collateral (which is enough to not be liquidated, because partyB total upnl is just 1000). partyA wants to close Position 1. Since it requires to reduce partyB allocatedBalance by 100 * (2000-1000) = 100000, it reverts.
+> 
+> Now if partyA wants to close Position 1, it first has to close Position 2, but in order to close it, partyA must have allocated balance of 99 * (2000 - 1000) = 99000. But partyA only has 20000, it doesn't have access to such huge amount. So it's still stuck.
+
+This does seem valid unless it is expected behavior for cross positions, any thoughts @MoonKnightDev ?
+
+**Navid-Fkh**
+
+We recognize that this is a limitation in our system.
+
+**What are we doing about it?**  
+At the moment, nothing. PartyB will remain trusted for this version of contracts. As a result, PartyB will ensure that adequate funds are allocated before executing fillClosingPosition. Moreover, users might need to close another position (like the one in a loss, as per your example) before they can close a profitable one.
+
+**Why don't we allow allocatedBalance to go negative?**  
+In the initial stages of designing the system, we chose to make the allocatedBalance unsigned to prevent further potential security threats. For instance, if "muon" were to be compromised, a user would only be able to deallocate up to their allocated amount now. However, if we allowed the allocatedBalance to go negative with a positive UPNL, this could lead to a much more significant challenge. We understand that there are some attack vectors with a compromised version of muon even now, but these are now far more complex, enabling our anomaly detection bots to identify and halt malicious activity more effectively.
+
+**Will the system always operate like this, even in subsequent versions?**  
+No. Future versions will introduce mechanisms that allow users to convert their unrealized profits into realized ones, providing a more effective solution for such scenarios.
+
+**nevillehuang**
+
+> We recognize that this is a limitation in our system.
+> 
+> **What are we doing about it?** At the moment, nothing. PartyB will remain trusted for this version of contracts. As a result, PartyB will ensure that adequate funds are allocated before executing fillClosingPosition. Moreover, users might need to close another position (like the one in a loss, as per your example) before they can close a profitable one.
+> 
+> **Why don't we allow allocatedBalance to go negative?** In the initial stages of designing the system, we chose to make the allocatedBalance unsigned to prevent further potential security threats. For instance, if "muon" were to be compromised, a user would only be able to deallocate up to their allocated amount now. However, if we allowed the allocatedBalance to go negative with a positive UPNL, this could lead to a much more significant challenge. We understand that there are some attack vectors with a compromised version of muon even now, but these are now far more complex, enabling our anomaly detection bots to identify and halt malicious activity more effectively.
+> 
+> **Will the system always operate like this, even in subsequent versions?** No. Future versions will introduce mechanisms that allow users to convert their unrealized profits into realized ones, providing a more effective solution for such scenarios.
+
+Very valid design decisions and concerns. I am now leaning towards Medium severity as I believe this is still a risk that users should be made known of before interacting with the protocol, that is the potential inability to close profiting positions without first closing losing ones.
+
+**panprog**
+
+> **What are we doing about it?** At the moment, nothing. PartyB will remain trusted for this version of contracts. As a result, PartyB will ensure that adequate funds are allocated before executing fillClosingPosition. Moreover, users might need to close another position (like the one in a loss, as per your example) before they can close a profitable one.
+
+There is still a scenario I've outlined in the escalation comment: `emergencyClosePosition` might always revert for partyB, because partyA might have multiple positions both in profit and in loss with different partyBs so that it doesn't have enough allocated balance to close that position. In this case partyB can't do anything about it and partyA doesn't have any incentive to allocate additional funds to let partyB do emergency close.
+
+I understand sponsor's point and intentions, but it's nonetheless a problem which can pop up in different scenarios unexpectedly, and not all of them might be fixable by actions such as depositing additional funds or closing the other positions first. And making it possible to realize unrealized pnl might also not fix all the problems, like the emergency close (maybe something else too).
+
+In the contest context, I still think this is a valid issue as it's a real problem, which was perhaps overlooked in the previous contest as it was a duplicate to very similar problem which only listed liquidation as impact, but the problem is more general than just liquidations. 
+
+As for the impact, I leave it up to sherlock to decide. I think it's high as the situation is quite easy to get into during normal trading flow (I've seen a lot of users opening opposite direction positions to "hedge", there might be trading strategies like statistical arbitrage - going long one asset and short another similar asset etc) and very unexpected for the users (and not always easily fixable). Also, it was a valid high in previous contest and is not fixed but marked "will fix".
+
+**hrishibhat**
+
+Result:
+Medium
+Unique
+Based on the points raised in the escalation the underlying issue still persists as a limitation and given the possible cases where the underflow can cause problems as mentioned above. Also, I agree with the Lead judge's points. 
+Considering this issue a valid medium
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [panprog](https://github.com/sherlock-audit/2023-08-symmetrical-judging/issues/10/#issuecomment-1723636832): accepted
+
+# Issue M-3: Position value can fall below minimum acceptable quote value when partially closing positions requested to be closed in full 
 
 Source: https://github.com/sherlock-audit/2023-08-symmetrical-judging/issues/12 
 
@@ -350,12 +636,20 @@ The condition should be to ignore the `minAcceptableQuoteValue` if request is fi
         }
 ```
 
-# Issue M-3: MultiAccount `depositAndAllocateForAccount` function doesn't scale the allocated amount correctly, failing to allocate enough funds 
+
+
+## Discussion
+
+**MoonKnightDev**
+
+Fixed Code PR: https://github.com/SYMM-IO/symmio-core/pull/31
+
+# Issue M-4: MultiAccount `depositAndAllocateForAccount` function doesn't scale the allocated amount correctly, failing to allocate enough funds 
 
 Source: https://github.com/sherlock-audit/2023-08-symmetrical-judging/issues/15 
 
 ## Found by 
-Hama, panprog, tvdung94, xiaoming90
+panprog, tvdung94, xiaoming90
 
 This is an issue very similar to [issue 222](https://github.com/sherlock-audit/2023-06-symmetrical-judging/issues/222) from previous audit contest, but in a `MultiAccount` smart contract.
 
@@ -445,4 +739,238 @@ The root cause differs. Here, you can easily rectify the allocatedBalance by all
 > The root cause differs. Here, you can easily rectify the allocatedBalance by allocating again. Moreover, no funds are lost
 
 Ok can be valid M according to Impact mentioned in the submission.
+
+**MoonKnightDev**
+
+Fixed Code PR: https://github.com/SYMM-IO/symmio-core/pull/35
+
+# Issue M-5: PartyBFacetImpl.chargeFundingRate should check whether quoteIds is empty array to prevent partyANonces from being increased, causing some operations of partyA to fail 
+
+Source: https://github.com/sherlock-audit/2023-08-symmetrical-judging/issues/41 
+
+## Found by 
+nobody2018
+
+[[PartyBFacetImpl.chargeFundingRate](https://github.com/sherlock-audit/2023-08-symmetrical/blob/main/symmio-core/contracts/facets/PartyB/PartyBFacetImpl.sol#L310-L315)](https://github.com/sherlock-audit/2023-08-symmetrical/blob/main/symmio-core/contracts/facets/PartyB/PartyBFacetImpl.sol#L310-L315) can increase `partyANonces[partyA]` by 1 with the `quoteIds` empty array. Some functions that partyA can call will use `partyANonces[partyA]` to verify the signature. This opens up the opportunity for partyB to DOS partyA until PartyB makes a profit or reduces its losses.
+
+## Vulnerability Detail
+
+```solidity
+File: symmio-core\contracts\facets\PartyB\PartyBFacetImpl.sol
+310:     function chargeFundingRate(
+311:         address partyA,
+312:         uint256[] memory quoteIds,
+313:         int256[] memory rates,
+314:         PairUpnlSig memory upnlSig
+315:     ) internal {
+316:         LibMuon.verifyPairUpnl(upnlSig, msg.sender, partyA);
+317:         require(quoteIds.length == rates.length, "PartyBFacet: Length not match");
+318:         int256 partyBAvailableBalance = LibAccount.partyBAvailableBalanceForLiquidation(
+319:             upnlSig.upnlPartyB,
+320:             msg.sender,
+321:             partyA
+322:         );
+323:         int256 partyAAvailableBalance = LibAccount.partyAAvailableBalanceForLiquidation(
+324:             upnlSig.upnlPartyA,
+325:             partyA
+326:         );
+327:         uint256 epochDuration;
+328:         uint256 windowTime;
+329:         for (uint256 i = 0; i < quoteIds.length; i++) {
+......//quoteIds is empty array, so code is never executed.
+390:         }
+391:         require(partyAAvailableBalance >= 0, "PartyBFacet: PartyA will be insolvent");
+392:         require(partyBAvailableBalance >= 0, "PartyBFacet: PartyB will be insolvent");
+393:         AccountStorage.layout().partyBNonces[msg.sender][partyA] += 1;
+394:->       AccountStorage.layout().partyANonces[partyA] += 1;
+395:     }
+```
+
+As long as `partyBAvailableBalance`(L318) and `partyAAvailableBalance`(L323) are greater than or equal to 0, that is to say, PartyA and PartyB are solvent. Then, partyB can add 1 to `partyANonces[partyA]` at little cost which is the gas of tx.
+
+An example is given to illustrate how to cause losses for partyA. Assume that partyA requests to close a quote via [[PartyAFacetImpl.requestToClosePosition](https://github.com/sherlock-audit/2023-08-symmetrical/blob/main/symmio-core/contracts/facets/PartyA/PartyAFacetImpl.sol#L150)](https://github.com/sherlock-audit/2023-08-symmetrical/blob/main/symmio-core/contracts/facets/PartyA/PartyAFacetImpl.sol#L150). PartyB ignored it. partyA can only wait for `maLayout.forceCloseCooldown` seconds, and then call [[PartyAFacetImpl.forceClosePosition](https://github.com/sherlock-audit/2023-08-symmetrical/blob/main/symmio-core/contracts/facets/PartyA/PartyAFacetImpl.sol#L239)](https://github.com/sherlock-audit/2023-08-symmetrical/blob/main/symmio-core/contracts/facets/PartyA/PartyAFacetImpl.sol#L239) to forcefully close the quote. 
+
+```solidity
+File: symmio-core\contracts\facets\PartyA\PartyAFacetImpl.sol
+239:     function forceClosePosition(uint256 quoteId, PairUpnlAndPriceSig memory upnlSig) internal {
+240:         AccountStorage.Layout storage accountLayout = AccountStorage.layout();
+241:         MAStorage.Layout storage maLayout = MAStorage.layout();
+242:         Quote storage quote = QuoteStorage.layout().quotes[quoteId];
+......//assume codes here are executed
+273:->       LibMuon.verifyPairUpnlAndPrice(upnlSig, quote.partyB, quote.partyA, quote.symbolId);
+......
+283:     }
+```
+
+L273, [[LibMuon.verifyPairUpnlAndPrice](https://github.com/sherlock-audit/2023-08-symmetrical/blob/main/symmio-core/contracts/libraries/LibMuon.sol#L181-L182)](https://github.com/sherlock-audit/2023-08-symmetrical/blob/main/symmio-core/contracts/libraries/LibMuon.sol#L181-L182) is used to verify signatures, where `partyBNonces[partyB][partyA]` and `partyANonces[partyA]` are used internally.
+
+If the current price goes against partyB, then partyB can front-run `forceClosePosition` and call `chargeFundingRate` to increase the nonces of both parties by 1. In this way, partyA's `forceClosePosition` will inevitably revert because the nonces are incorrect.
+
+Similarly, if partyA wants to deallocate funds via [[AccountFacetImpl.deallocate](https://github.com/sherlock-audit/2023-08-symmetrical/blob/main/symmio-core/contracts/facets/Account/AccountFacetImpl.sol#L53)](https://github.com/sherlock-audit/2023-08-symmetrical/blob/main/symmio-core/contracts/facets/Account/AccountFacetImpl.sol#L53), partyB can also prevent this operation via `chargeFundingRate`.
+
+## Impact
+
+Due to this issue, partyB can increase nonces of any partyA with little cost, causing some operations of partyA to fail (refer to the Vulnerability Detail section). This opens up the opportunity for partyB to turn the table.
+
+## Code Snippet
+
+https://github.com/sherlock-audit/2023-08-symmetrical/blob/main/symmio-core/contracts/facets/PartyB/PartyBFacetImpl.sol#L310-L315
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+```solidity
+File: symmio-core\contracts\facets\PartyB\PartyBFacetImpl.sol
+310:     function chargeFundingRate(
+311:         address partyA,
+312:         uint256[] memory quoteIds,
+313:         int256[] memory rates,
+314:         PairUpnlSig memory upnlSig
+315:     ) internal {
+316:         LibMuon.verifyPairUpnl(upnlSig, msg.sender, partyA);
+317:-        require(quoteIds.length == rates.length, "PartyBFacet: Length not match");
+317:+        require(quoteIds.length > 0 && quoteIds.length == rates.length, "PartyBFacet: Length is 0 or Length not match");
+```
+
+
+
+
+## Discussion
+
+**sherlock-admin**
+
+1 comment(s) were left on this issue during the judging contest.
+
+**panprog** commented:
+> valid medium
+
+
+
+**securitygrid**
+
+Escalate
+This is not a dup of #31. Please review it.
+This issue describes how PartyB uses `chargeFundingRate` to cause PartyA to suffer losses. 
+**All PartyB can easily take advantage of it against PartyA, making themselves always profitable**.
+Consider the following two situations here:
+1. If the current price goes for PartyB, then the quote is closed and PartyB makes a profit.
+2. If the current price goes against PartyB, then PartyB can use this issue to prevent PartyA from forcibly closing the quote until the price goes for PartyB.
+
+
+
+**sherlock-admin2**
+
+ > Escalate
+> This is not a dup of #31. Please review it.
+> This issue describes how PartyB uses `chargeFundingRate` to cause PartyA to suffer losses. 
+> **All PartyB can easily take advantage of it against PartyA, making themselves always profitable**.
+> Consider the following two situations here:
+> 1. If the current price goes for PartyB, then the quote is closed and PartyB makes a profit.
+> 2. If the current price goes against PartyB, then PartyB can use this issue to prevent PartyA from forcibly closing the quote until the price goes for PartyB.
+> 
+> 
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**nevillehuang**
+
+> Escalate This is not a dup of #31. Please review it. This issue describes how PartyB uses `chargeFundingRate` to cause PartyA to suffer losses. **All PartyB can easily take advantage of it against PartyA, making themselves always profitable**. Consider the following two situations here:
+> 
+> 1. If the current price goes for PartyB, then the quote is closed and PartyB makes a profit.
+> 2. If the current price goes against PartyB, then PartyB can use this issue to prevent PartyA from forcibly closing the quote until the price goes for PartyB.
+> 
+> So this issue can be H.
+
+Agreed, although both stems from the same root case of abusing chargeFundingRate to increment nonce, it is not a duplicate of #31 given that issue is invalid. This is talking about partyB potentially causing losses to partyA not about preventing its own liquidation process.
+
+@MoonKnightDev want to hear ur thoughts on this, given protocol determines party B is a trusted role. 
+
+**panprog**
+
+Escalate
+
+I believe this is a valid medium. It is similar to #31 in that it uses nonce increase to block certain functionality, however #31 only lists liquidation as impact (which is invalid), while this issue shows valid impact for partyB to be able to avoid `forceClosePosition`. I think function from #31 (`deallocate`) and also `transferAllocation` can also be used for the same (increase partyB nonce to prevent `forceClosePosition`).
+
+So from my view:
+- core reason: the same as #31 (which also mentions `chargeFundingRate`, without details though)
+- impact: this issue - valid medium. #31 - invalid.
+
+If identifiying core reason is enough to make issue valid, then #31 should also be a (valid) dup of this. But I personally think that lack of correct impact should keep it invalid.
+
+As to why it's medium - it requires partyB to be malicious, and since partyB is semi-trusted role - as established in previous contest, all issues caused by malicious partyB should be treated as medium.
+
+Based on all of this I think this should be a valid medium while #31 should remain invalid.
+
+**sherlock-admin2**
+
+ > Escalate
+> 
+> I believe this is a valid medium. It is similar to #31 in that it uses nonce increase to block certain functionality, however #31 only lists liquidation as impact (which is invalid), while this issue shows valid impact for partyB to be able to avoid `forceClosePosition`. I think function from #31 (`deallocate`) and also `transferAllocation` can also be used for the same (increase partyB nonce to prevent `forceClosePosition`).
+> 
+> So from my view:
+> - core reason: the same as #31 (which also mentions `chargeFundingRate`, without details though)
+> - impact: this issue - valid medium. #31 - invalid.
+> 
+> If identifiying core reason is enough to make issue valid, then #31 should also be a (valid) dup of this. But I personally think that lack of correct impact should keep it invalid.
+> 
+> As to why it's medium - it requires partyB to be malicious, and since partyB is semi-trusted role - as established in previous contest, all issues caused by malicious partyB should be treated as medium.
+> 
+> Based on all of this I think this should be a valid medium while #31 should remain invalid.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**nevillehuang**
+
+> Escalate
+> 
+> I believe this is a valid medium. It is similar to #31 in that it uses nonce increase to block certain functionality, however #31 only lists liquidation as impact (which is invalid), while this issue shows valid impact for partyB to be able to avoid `forceClosePosition`. I think function from #31 (`deallocate`) and also `transferAllocation` can also be used for the same (increase partyB nonce to prevent `forceClosePosition`).
+> 
+> So from my view:
+> 
+> * core reason: the same as [xiaoming90 - PartyB can block liquidation by incrementing the nonce #31](https://github.com/sherlock-audit/2023-08-symmetrical-judging/issues/31) (which also mentions `chargeFundingRate`, without details though)
+> * impact: this issue - valid medium. [xiaoming90 - PartyB can block liquidation by incrementing the nonce #31](https://github.com/sherlock-audit/2023-08-symmetrical-judging/issues/31) - invalid.
+> 
+> If identifiying core reason is enough to make issue valid, then #31 should also be a (valid) dup of this. But I personally think that lack of correct impact should keep it invalid.
+> 
+> As to why it's medium - it requires partyB to be malicious, and since partyB is semi-trusted role - as established in previous contest, all issues caused by malicious partyB should be treated as medium.
+> 
+> Based on all of this I think this should be a valid medium while #31 should remain invalid.
+
+Agree with this escalation. Unless there is a sufficient penalty mechanism in place for partyB to avoid abusing this vulnerability, this submission should be a valid medium. And given #31 wrongly identifies the attack path from the root cause, it is a valid low based on sherlocks rule [here](https://docs.sherlock.xyz/audits/judging/judging#ix.-duplication-rules) and thus is invalid:
+
+> - In addition to this, there is a submission D which identifies the core issue but does not clearly describe the impact or an attack path. Then D is considered low.
+
+**securitygrid**
+
+Agree that this is M since some issues about malicious partyB were M in previous contest.
+
+**hrishibhat**
+
+Result:
+Medium
+Unique
+Considering this a valid issue on its own based on the above comments
+
+**sherlock-admin2**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [securitygrid](https://github.com/sherlock-audit/2023-08-symmetrical-judging/issues/41/#issuecomment-1723552615): accepted
+- [panprog](https://github.com/sherlock-audit/2023-08-symmetrical-judging/issues/41/#issuecomment-1724285656): accepted
+
+**MoonKnightDev**
+
+Fixed Code PR: https://github.com/SYMM-IO/symmio-core/pull/37/commits/80eb930a4c8ba8f4a89f17ad085412f9a41a11cd
 
