@@ -162,6 +162,10 @@ Include partyA and partyB nonces in the liquidation signature.
 
 Fixed Code PR: https://github.com/SYMM-IO/symmio-core/pull/34
 
+**xiaoming9090**
+
+Verified. Fixed in [PR 34](https://github.com/SYMM-IO/symmio-core/pull/34). 
+
 # Issue H-2: `liquidatePositionsPartyA` limits partyB loss to partyB allocated balance, which can lead to inflated partyB balance and loss of funds for protocol users 
 
 Source: https://github.com/sherlock-audit/2023-08-symmetrical-judging/issues/6 
@@ -219,6 +223,10 @@ Calculate total (signed) pnl for positions for each partyB before applying it: `
 
 Fixed Code PR: https://github.com/SYMM-IO/symmio-core/pull/36
 
+**xiaoming9090**
+
+Verified. Fixed in [PR 36](https://github.com/SYMM-IO/symmio-core/pull/36)
+
 # Issue M-1: Wrong calculation of solvency in `fillCloseRequest` prevents the position from being closed even if the user is solvent after position closure 
 
 Source: https://github.com/sherlock-audit/2023-08-symmetrical-judging/issues/9 
@@ -262,6 +270,10 @@ Require both parties to only be solvent at `closePrice` when the position is clo
 **MoonKnightDev**
 
 Fixed Code PR: https://github.com/SYMM-IO/symmio-core/pull/32
+
+**xiaoming9090**
+
+Verified. Fixed in [PR 32](https://github.com/SYMM-IO/symmio-core/pull/32)
 
 # Issue M-2: Position closure might always revert in some cases due to allocatedBalances being unsigned, preventing the user from closing its positions 
 
@@ -644,6 +656,10 @@ The condition should be to ignore the `minAcceptableQuoteValue` if request is fi
 
 Fixed Code PR: https://github.com/SYMM-IO/symmio-core/pull/31
 
+**xiaoming9090**
+
+Verified. Fixed in [PR 31](https://github.com/SYMM-IO/symmio-core/pull/31).
+
 # Issue M-4: MultiAccount `depositAndAllocateForAccount` function doesn't scale the allocated amount correctly, failing to allocate enough funds 
 
 Source: https://github.com/sherlock-audit/2023-08-symmetrical-judging/issues/15 
@@ -743,6 +759,10 @@ Ok can be valid M according to Impact mentioned in the submission.
 **MoonKnightDev**
 
 Fixed Code PR: https://github.com/SYMM-IO/symmio-core/pull/35
+
+**xiaoming9090**
+
+Verified. Fixed in [PR 35](https://github.com/SYMM-IO/symmio-core/pull/35).
 
 # Issue M-5: PartyBFacetImpl.chargeFundingRate should check whether quoteIds is empty array to prevent partyANonces from being increased, causing some operations of partyA to fail 
 
@@ -973,4 +993,8 @@ Escalation status:
 **MoonKnightDev**
 
 Fixed Code PR: https://github.com/SYMM-IO/symmio-core/pull/37/commits/80eb930a4c8ba8f4a89f17ad085412f9a41a11cd
+
+**xiaoming9090**
+
+Verified. Fixed in https://github.com/SYMM-IO/symmio-core/commit/80eb930a4c8ba8f4a89f17ad085412f9a41a11cd. 
 
